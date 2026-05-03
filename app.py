@@ -273,6 +273,49 @@ def get_tables(host, db, user, pwd, port):
         return []
 
 
+def safety_preview_popup(root, summary_text):
+    """
+    Shows a modal confirmation popup with a summary.
+    Returns True if user clicks Proceed, False if Cancel.
+    """
+    win = tk.Toplevel(root)
+    win.title("Safety Preview")
+    win.geometry("700x500")
+    win.grab_set()   # Make modal
+
+    tk.Label(win, text="Review Changes Before Writing to DB2",
+             font=("Arial", 12, "bold")).pack(pady=10)
+
+    text_box = tk.Text(win, height=20, width=80, wrap="word")
+    text_box.pack(padx=10, pady=5)
+    text_box.insert(tk.END, summary_text)
+    text_box.config(state="disabled")
+
+    result = {"value": False}
+
+    def proceed():
+        result["value"] = True
+        win.destroy()
+
+    def cancel():
+        result["value"] = False
+        win.destroy()
+
+    btn_frame = tk.Frame(win)
+    btn_frame.pack(pady=10)
+
+    tk.Button(btn_frame, text="Proceed",
+              width=15, bg="#4CAF50", fg="white",
+              command=proceed).pack(side="left", padx=10)
+
+    tk.Button(btn_frame, text="Cancel",
+              width=15, bg="#E53935", fg="white",
+              command=cancel).pack(side="left", padx=10)
+
+    win.wait_window()
+    return result["value"]
+
+
 # ---------- ROBUST SQL EXTRACTOR (handles comments/missing semicolons/CTEs) ----------
 TARGET_DB_RE = re.compile(r'--\s*db\s*:\s*(db1|db2)\b', flags=re.IGNORECASE)
 
@@ -414,6 +457,189 @@ def compute_matches(tables1, tables2):
         matches.append((t1, best_real, score))
     return matches
 
+
+
+
+def preprocess_db2_table(conn1, conn2, t1, t2, id_col, mapping, missing_in_db2, extra_in_db2):
+    """
+    Preprocess DB2 table using DB1 schema as source of truth.
+    Safe, logged, and includes a user confirmation preview.
+    """
+
+    import pandas as pd
+
+    log(f"[PROCESS] Starting preprocessing: DB1='{t1}'  DB2='{t2}'")
+
+    # ----------------------------
+    # 1. Load DB1 schema
+    # ----------------------------
+    cols1 = get_columns(conn1, t1)
+    if not cols1:
+        msg = f"[ERROR] DB1 columns not found for '{t1}'"
+        log(msg)
+        return msg
+
+    log(f"[SCHEMA] DB1 columns: {cols1}")
+
+    # ----------------------------
+    # 2. Load DB2 into DataFrame
+    # ----------------------------
+    log(f"[LOAD] Reading DB2 table '{t2}'")
+    try:
+        rows = run_sql(conn2, f'SELECT * FROM "{t2}"')
+        if isinstance(rows, list) and rows and isinstance(rows[0], str) and rows[0].startswith("SQL Error"):
+            log("[SQL ERROR] " + rows[0])
+            return rows[0]
+    except Exception as e:
+        msg = f"[SQL ERROR] Cannot read DB2 '{t2}': {e}"
+        log(msg)
+        return msg
+
+    df = pd.DataFrame(rows, columns=get_columns(conn2, t2))
+    log(f"[LOAD] Loaded {len(df)} rows and {len(df.columns)} columns from DB2")
+
+    output_log = []
+
+    # ----------------------------
+    # 3. Apply column renames (DB2 -> DB1)
+    # ----------------------------
+    rename_map = {}
+    for pair in mapping:
+        try:
+            left, right = pair.split(":")
+            left, right = left.strip(), right.strip()
+        except:
+            log(f"[WARN] Bad mapping pair: '{pair}'")
+            continue
+
+        if right in df.columns:
+            rename_map[right] = left
+            msg = f"Rename '{right}' → '{left}'"
+            output_log.append(msg)
+            log("[RENAME] " + msg)
+        else:
+            log(f"[SKIP] Column '{right}' not in DB2 → cannot rename")
+
+    df = df.rename(columns=rename_map)
+
+    # ----------------------------
+    # IMPORTANT FIX:
+    # Update ID column if renamed
+    # ----------------------------
+    if id_col in rename_map:
+        new_id = rename_map[id_col]
+        log(f"[ID-FIX] ID column renamed: '{id_col}' → '{new_id}'")
+        id_col = new_id
+    else:
+        # Case-insensitive fallback
+        for old, new in rename_map.items():
+            if old.lower() == id_col.lower():
+                log(f"[ID-FIX] ID normalized: '{id_col}' → '{new}'")
+                id_col = new
+                break
+
+    # ----------------------------
+    # 4. Add missing columns (DB1-only)
+    # ----------------------------
+    for col in missing_in_db2:
+        if col not in df.columns:
+            df[col] = ""
+            msg = f"Added missing DB1 column '{col}'"
+            output_log.append(msg)
+            log("[ADD] " + msg)
+
+    # ----------------------------
+    # 5. Drop extra DB2-only columns
+    # ----------------------------
+    for col in extra_in_db2:
+        if col in df.columns:
+            df = df.drop(columns=[col])
+            msg = f"Dropped extra DB2 column '{col}'"
+            output_log.append(msg)
+            log("[DROP] " + msg)
+
+    # ----------------------------
+    # 6. Guarantee DB1 schema completeness
+    # ----------------------------
+    for col in cols1:
+        if col not in df.columns:
+            df[col] = ""
+            log(f"[FIX] Added missing column before reorder: '{col}'")
+
+    # ----------------------------
+    # 7. Reorder columns to DB1 exact order
+    # ----------------------------
+    log("[ORDER] Reordering columns to DB1 order")
+    df = df[[c for c in cols1]]
+
+    # ----------------------------
+    # 8. Deduplicate by ID
+    # ----------------------------
+    log(f"[DEDUP] Removing duplicates using ID='{id_col}'")
+
+    if id_col not in df.columns:
+        msg = f"[ERROR] ID column '{id_col}' missing AFTER preprocessing!"
+        log(msg)
+        return msg
+
+    before = len(df)
+    df = df.drop_duplicates(subset=[id_col], keep="first")
+    removed = before - len(df)
+
+    msg = f"Removed {removed} duplicate rows"
+    output_log.append(msg)
+    log("[DEDUP] " + msg)
+
+    # ----------------------------
+    # 9. Build safety preview
+    # ----------------------------
+    final_table = f"{t1}_processed"
+    summary = "\n".join([
+        f"DB1 Reference Table: {t1}",
+        f"DB2 Source Table: {t2}",
+        "",
+        "Planned Changes:",
+        *output_log,
+        "",
+        "Final Column Order:",
+        ", ".join(df.columns),
+        "",
+        f"Rows After Dedup: {len(df)}",
+        "",
+        f"Target Table: {final_table}",
+    ])
+
+    log("[PREVIEW] Showing safety preview dialog…")
+
+    if not safety_preview_popup(root, summary):
+        log("[CANCEL] User cancelled preprocessing.")
+        return "Operation cancelled."
+
+    # ----------------------------
+    # 10. Write processed table
+    # ----------------------------
+    try:
+        log(f"[SAVE] Writing processed table '{final_table}'")
+
+        with psycopg2.connect(**conn2) as conn:
+            with conn.cursor() as cur:
+                cur.execute(f'DROP TABLE IF EXISTS "{final_table}"')
+
+                col_defs = ", ".join(f'"{c}" TEXT' for c in df.columns)
+                cur.execute(f'CREATE TABLE "{final_table}" ({col_defs});')
+
+                records = df.astype(str).values.tolist()
+                columns_sql = ", ".join(f'"{c}"' for c in df.columns)
+                insert_sql = f'INSERT INTO "{final_table}" ({columns_sql}) VALUES %s'
+                execute_values(cur, insert_sql, records)
+
+        log(f"[SUCCESS] Saved processed table '{final_table}' with {len(df)} rows.")
+        return f"Saved processed table '{final_table}'."
+
+    except Exception as e:
+        msg = f"[ERROR] Failed writing processed table: {e}"
+        log(msg)
+        return msg
 
 def find_data_files(folder_path):
     data_files = []
@@ -671,6 +897,133 @@ def render_mapping_ui(matches, tables2, conn1, conn2):
 
         # Fallback: original signature without any model kw
         return _run_llm(prompt)
+
+    def on_process_data(pb, rb, t1_local, t2_local, id2_local):
+        """
+        LLM column comparison → safe parsing → column mapping summary →
+        preprocessing with safety preview → final DB write.
+        """
+
+        def worker():
+            try:
+                rb.delete("1.0", tk.END)
+
+                if not t2_local:
+                    enqueue_ui(lambda: rb.insert(tk.END, "[ERROR] No DB2 table selected.\n"))
+                    return
+
+                if not id2_local:
+                    enqueue_ui(lambda: rb.insert(tk.END, "[ERROR] No DB2 ID column selected.\n"))
+                    return
+
+                # ------------------------------------------------
+                # 1. Build strict LLM prompt
+                # ------------------------------------------------
+                cols1 = get_columns(conn1, t1_local)
+                cols2 = get_columns(conn2, t2_local)
+
+                prompt = (
+                    f"Compare the columns of DB1 table '{t1_local}' and DB2 table '{t2_local}'.\n\n"
+                    f"DB1 columns:\n{cols1}\n\n"
+                    f"DB2 columns:\n{cols2}\n\n"
+                    "Return EXACTLY these 3 lines and NOTHING ELSE:\n"
+                    "missing_in_db2: [...]\n"
+                    "missing_in_db1: [...]\n"
+                    "possible_mappings: ['DB1col:DB2col', ...]\n"
+                    "If names match ignoring case, include a mapping pair."
+                )
+
+                log(f"[LLM] Running Compare Columns for {t1_local} → {t2_local}")
+
+                llm_out = call_llm_with_selected_model(prompt)
+
+                enqueue_ui(lambda: rb.insert(tk.END, "LLM raw output:\n" + llm_out + "\n\n"))
+
+                # ------------------------------------------------
+                # 2. Parse LLM output robustly
+                # ------------------------------------------------
+                lines = [l.strip() for l in llm_out.splitlines() if l.strip()]
+                parsed = {"missing_in_db2": [], "missing_in_db1": [], "possible_mappings": []}
+
+                for line in lines:
+                    if line.startswith("missing_in_db2"):
+                        try:
+                            parsed["missing_in_db2"] = eval(line.split(":", 1)[1].strip())
+                        except:
+                            pass
+                    elif line.startswith("missing_in_db1"):
+                        try:
+                            parsed["missing_in_db1"] = eval(line.split(":", 1)[1].strip())
+                        except:
+                            pass
+                    elif line.startswith("possible_mappings"):
+                        try:
+                            parsed["possible_mappings"] = eval(line.split(":", 1)[1].strip())
+                        except:
+                            pass
+
+                missing_in_db2 = parsed["missing_in_db2"]
+                extra_in_db2 = parsed["missing_in_db1"]
+                possible_mappings = parsed["possible_mappings"]
+
+                # ------------------------------------------------
+                # 3. Auto‑mapping fallback
+                # ------------------------------------------------
+                if not possible_mappings or any(":" not in p for p in possible_mappings):
+                    log("[WARN] Invalid LLM mappings → generating automatic fallback mappings.")
+
+                    possible_mappings = []
+                    for c1 in cols1:
+                        for c2 in cols2:
+                            if c1.lower() == c2.lower():
+                                possible_mappings.append(f"{c1}:{c2}")
+
+                    enqueue_ui(lambda: rb.insert(tk.END,
+                                                 "[WARNING] Using fallback auto‑mappings:\n" +
+                                                 str(possible_mappings) + "\n\n"
+                                                 ))
+
+                # ------------------------------------------------
+                # 4. Display column matching summary
+                # ------------------------------------------------
+                summary = []
+                summary.append("===== COLUMN MATCHING SUMMARY =====\n")
+                summary.append("Missing in DB2 (add):")
+                summary.append(str(missing_in_db2))
+                summary.append("\nExtra in DB2 (drop):")
+                summary.append(str(extra_in_db2))
+                summary.append("\nMappings (DB2 → DB1):")
+                for pair in possible_mappings:
+                    left, right = pair.split(":")
+                    summary.append(f"{right.strip()} → {left.strip()}")
+                summary.append("\n===================================\n\n")
+
+                enqueue_ui(lambda: rb.insert(tk.END, "\n".join(summary)))
+
+                # ------------------------------------------------
+                # 5. Run preprocessing pipeline
+                # ------------------------------------------------
+                log(f"[PROCESS] Running preprocessing for table '{t2_local}'")
+
+                output = preprocess_db2_table(
+                    conn1, conn2,
+                    t1=t1_local,
+                    t2=t2_local,
+                    id_col=id2_local,
+                    mapping=possible_mappings,
+                    missing_in_db2=missing_in_db2,
+                    extra_in_db2=extra_in_db2
+                )
+
+                enqueue_ui(lambda: rb.insert(tk.END, "\nProcessing Result:\n" + str(output)))
+
+            except Exception as e:
+                log(f"[ERROR] on_process_data exception: {e}")
+                enqueue_ui(lambda: rb.insert(tk.END, f"[ERROR] {e}\n"))
+
+        # Run non-blocking
+        threading.Thread(target=worker, daemon=True).start()
+
     # ---------------- HEADER ----------------
     headers = ["DB1 Table", "DB2 Table", "Accuracy", "Template", "DB1 ID", "DB2 ID"]
     for col, text in enumerate(headers):
@@ -984,6 +1337,12 @@ def render_mapping_ui(matches, tables2, conn1, conn2):
 
         run_button = tk.Button(inner_frame, text="Run", command=on_run_click)
         run_button.grid(row=row + 1, column=2, padx=10, sticky="nw")
+
+        process_button = tk.Button(inner_frame, text="Process Data",
+                                   command=lambda pb=prompt_box, rb=result_box, t1=t1,
+                                                  t2=db2_var, id1=id1_var, id2=id2_var:
+                                   on_process_data(pb, rb, t1, t2.get(), id2.get()))
+        process_button.grid(row=row + 1, column=4, padx=10, sticky="nw")
 
         row_widgets.append({
             "t1": t1,

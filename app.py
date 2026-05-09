@@ -10,6 +10,7 @@ import threading
 from queue import Queue, Empty
 import time
 import html  # unescape &gt; &lt; &amp;
+from llm_engine import run_llm, list_llms
 
 # ---------------- GLOBALS ----------------
 mapping_vars = []
@@ -816,13 +817,13 @@ def choose_conn_for_query(q: str, conn1, conn2, t1_local: str, t2_local: str):
 
 
 # ---------------- MAPPING UI ----------------
-from llm_engine import run_llm, list_llms
+
 
 def render_mapping_ui(matches, tables2, conn1, conn2):
     map_win = tk.Toplevel(root)
     map_win.title("Table Mapping (DB1 → DB2)")
     map_win.geometry("1700x950")
-
+    map_win.state("zoomed")
     local_spinners = []
 
     # Scrollable canvas
